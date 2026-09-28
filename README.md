@@ -27,11 +27,11 @@ Download the current Linux archive from the public release, verify it if you
 want, then install:
 
 ```sh
-curl -fLO https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.4/opencode-smart-launcher-linux-0.1.4.tar.gz
-curl -fLO https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.4/SHA256SUMS
+curl -fLO https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.5/opencode-smart-launcher-linux-0.1.5.tar.gz
+curl -fLO https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.5/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf opencode-smart-launcher-linux-0.1.4.tar.gz
-cd opencode-smart-launcher-0.1.4
+tar -xzf opencode-smart-launcher-linux-0.1.5.tar.gz
+cd opencode-smart-launcher-0.1.5
 chmod +x install.sh
 ./install.sh
 ```
@@ -53,7 +53,7 @@ needed when OpenCode itself must be installed.
 ## Windows installation
 
 Download
-[`opencode-smart-launcher-windows-0.1.4.zip`](https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.4/opencode-smart-launcher-windows-0.1.4.zip),
+[`opencode-smart-launcher-windows-0.1.5.zip`](https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.5/opencode-smart-launcher-windows-0.1.5.zip),
 extract it, open PowerShell in the extracted directory, and run:
 
 ```powershell
@@ -74,8 +74,9 @@ To uninstall only the wrapper while keeping OpenCode:
 ```
 
 Windows PowerShell 5.1 or PowerShell 7 is supported. No Python installation is
-required on Windows. The installer also includes extensionless entry points so
-the same `opencode` and `opencode-free` commands work in Git Bash.
+required on Windows. When Git Bash is present, the installer also places
+managed entry points in `~/bin` so the same `opencode` and `opencode-free`
+commands work immediately in existing and new Git Bash terminals.
 
 ## Use and health checks
 

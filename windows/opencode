@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
+# managed-by: opencode-smart-launcher
 set -e
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-launcher=$(cygpath -w "$script_dir/opencode-smart.ps1")
+if [ -n "${LOCALAPPDATA:-}" ]; then
+  launcher_root=$(cygpath -u "$LOCALAPPDATA")/Programs/opencode-smart-launcher/bin
+else
+  launcher_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+fi
+launcher=$(cygpath -w "$launcher_root/opencode-smart.ps1")
 exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$launcher" "$@"

@@ -12,6 +12,8 @@ $ManagedOpenCodeDir = Join-Path $env:LOCALAPPDATA "Programs\opencode-v2\bin"
 $ConfigDir = Join-Path $env:LOCALAPPDATA "opencode-smart-launcher"
 $ConfigPath = Join-Path $ConfigDir "config.json"
 $SourceDir = Join-Path $PSScriptRoot "windows"
+$GitBashBinDir = Join-Path $HOME "bin"
+$GitBashShimMarker = "# managed-by: opencode-smart-launcher"
 
 function Set-UserPath([string[]]$Entries) {
     [Environment]::SetEnvironmentVariable("Path", ($Entries -join ';'), "User")
@@ -23,8 +25,17 @@ function Remove-LauncherPath {
     Set-UserPath $entries
 }
 
+function Test-ManagedGitBashShim([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try { return (Get-Content -LiteralPath $Path -Raw).Contains($GitBashShimMarker) } catch { return $false }
+}
+
 if ($Uninstall) {
     Remove-LauncherPath
+    foreach ($name in @("opencode", "opencode-free")) {
+        $shimPath = Join-Path $GitBashBinDir $name
+        if (Test-ManagedGitBashShim $shimPath) { Remove-Item -LiteralPath $shimPath -Force }
+    }
     if (Test-Path -LiteralPath $InstallRoot) { Remove-Item -LiteralPath $InstallRoot -Recurse -Force }
     if (Test-Path -LiteralPath $ConfigPath) { Remove-Item -LiteralPath $ConfigPath -Force }
     if (Test-Path -LiteralPath $ConfigDir) {
@@ -142,6 +153,23 @@ Copy-Item -LiteralPath (Join-Path $SourceDir "opencode.cmd") -Destination (Join-
 Copy-Item -LiteralPath (Join-Path $SourceDir "opencode-free.cmd") -Destination (Join-Path $BinDir "opencode-free.cmd") -Force
 Copy-Item -LiteralPath (Join-Path $SourceDir "opencode") -Destination (Join-Path $BinDir "opencode") -Force
 Copy-Item -LiteralPath (Join-Path $SourceDir "opencode-free") -Destination (Join-Path $BinDir "opencode-free") -Force
+
+$gitBashPresent = @(
+    "C:\Program Files\Git\bin\bash.exe",
+    "C:\Program Files\Git\usr\bin\bash.exe",
+    (Join-Path $env:LOCALAPPDATA "Programs\Git\bin\bash.exe")
+) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if ($gitBashPresent) {
+    New-Item -ItemType Directory -Force -Path $GitBashBinDir | Out-Null
+    foreach ($name in @("opencode", "opencode-free")) {
+        $gitBashShim = Join-Path $GitBashBinDir $name
+        if ((Test-Path -LiteralPath $gitBashShim) -and -not (Test-ManagedGitBashShim $gitBashShim)) {
+            Write-Warning "$gitBashShim already exists and is not managed by this installer; leaving it unchanged"
+            continue
+        }
+        Copy-Item -LiteralPath (Join-Path $SourceDir $name) -Destination $gitBashShim -Force
+    }
+}
 
 @{ schema = 1; real_binary = $RealBinary } | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
 
