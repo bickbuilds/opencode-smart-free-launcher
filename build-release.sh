@@ -32,6 +32,8 @@ files = [
     "windows/opencode-smart.ps1",
     "windows/opencode.cmd",
     "windows/opencode-free.cmd",
+    "windows/opencode",
+    "windows/opencode-free",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",

@@ -34,7 +34,7 @@ if ($Uninstall) {
     exit 0
 }
 
-foreach ($required in @("opencode-smart.ps1", "opencode.cmd", "opencode-free.cmd")) {
+foreach ($required in @("opencode-smart.ps1", "opencode.cmd", "opencode-free.cmd", "opencode", "opencode-free")) {
     if (-not (Test-Path -LiteralPath (Join-Path $SourceDir $required))) {
         throw "$required is missing from the windows directory beside install.ps1"
     }
@@ -140,6 +140,8 @@ New-Item -ItemType Directory -Force -Path $BinDir, $ConfigDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $SourceDir "opencode-smart.ps1") -Destination (Join-Path $BinDir "opencode-smart.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $SourceDir "opencode.cmd") -Destination (Join-Path $BinDir "opencode.cmd") -Force
 Copy-Item -LiteralPath (Join-Path $SourceDir "opencode-free.cmd") -Destination (Join-Path $BinDir "opencode-free.cmd") -Force
+Copy-Item -LiteralPath (Join-Path $SourceDir "opencode") -Destination (Join-Path $BinDir "opencode") -Force
+Copy-Item -LiteralPath (Join-Path $SourceDir "opencode-free") -Destination (Join-Path $BinDir "opencode-free") -Force
 
 @{ schema = 1; real_binary = $RealBinary } | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
 
