@@ -66,9 +66,26 @@ function Convert-HexToBase64([string]$Hex) {
     return [Convert]::ToBase64String($bytes)
 }
 
+function Get-WindowsArchitecture {
+    # Windows PowerShell 5.1 runs on .NET Framework, where
+    # RuntimeInformation.OSArchitecture is not consistently available. These
+    # variables report the native OS architecture even from a 32-bit process.
+    $value = if ($env:PROCESSOR_ARCHITEW6432) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+    if (-not $value) { throw "Windows did not report a processor architecture" }
+    switch ($value.ToUpperInvariant()) {
+        "AMD64" { return "x64" }
+        "X86_64" { return "x64" }
+        "ARM64" { return "arm64" }
+        default { throw "Unsupported Windows architecture: $value" }
+    }
+}
+
 function Install-OfficialOpenCode {
-    $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-    if ($architecture -notin @("x64", "arm64")) { throw "Unsupported Windows architecture: $architecture" }
+    $architecture = Get-WindowsArchitecture
     $target = "windows-$architecture"
     if ($architecture -eq "x64") {
         try {

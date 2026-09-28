@@ -27,11 +27,11 @@ Download the current Linux archive from the public release, verify it if you
 want, then install:
 
 ```sh
-curl -fLO https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.0/opencode-smart-launcher-linux-0.1.0.tar.gz
-curl -fLO https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.0/SHA256SUMS
+curl -fLO https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.1/opencode-smart-launcher-linux-0.1.1.tar.gz
+curl -fLO https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.1/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf opencode-smart-launcher-linux-0.1.0.tar.gz
-cd opencode-smart-launcher-0.1.0
+tar -xzf opencode-smart-launcher-linux-0.1.1.tar.gz
+cd opencode-smart-launcher-0.1.1
 chmod +x install.sh
 ./install.sh
 ```
@@ -53,7 +53,7 @@ needed when OpenCode itself must be installed.
 ## Windows installation
 
 Download
-[`opencode-smart-launcher-windows-0.1.0.zip`](https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.0/opencode-smart-launcher-windows-0.1.0.zip),
+[`opencode-smart-launcher-windows-0.1.1.zip`](https://github.com/bickbuilds/opencode-smart-free-launcher/releases/download/v0.1.1/opencode-smart-launcher-windows-0.1.1.zip),
 extract it, open PowerShell in the extracted directory, and run:
 
 ```powershell
