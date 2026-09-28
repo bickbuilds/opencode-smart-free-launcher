@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""Launch OpenCode with the highest-ranked currently-free OpenCode Zen model."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+CATALOG_URL = "https://models.dev/api.json"
+STATS_URL = "https://stats.opencode.ai/"
+EBBWATER_URL = "https://www.ebbwater.net/tools/opencode"
+CACHE_TTL_SECONDS = 24 * 60 * 60
+FALLBACK_CACHE_TTL_SECONDS = 60 * 60
+EBBWATER_MAX_AGE_SECONDS = 3 * 24 * 60 * 60
+SUBCOMMANDS = {
+    "acp",
+    "api",
+    "auth",
+    "debug",
+    "mcp",
+    "mini",
+    "models",
+    "pair",
+    "plugin",
+    "reload",
+    "run",
+    "serve",
+    "service",
+    "session",
+    "stats",
+    "uninstall",
+    "update",
+    "upgrade",
+}
+RESUME_FLAGS = {"--continue", "-c", "--session", "-s"}
+PASSTHROUGH_FLAGS = {"--help", "-h", "--version", "-v", "--completions"}
+
+# Used only if the catalog is reachable but the public usage page is not. The
+# chosen entry must still be present in the live catalog with zero input/output
+# cost and tool support before it can be selected.
+FALLBACK_PREFERENCE = [
+    "space-bunny-free",
+    "deepseek-v4-flash-free",
+    "muse-spark-1.3-contributor-free",
+    "mimo-v2.6-flash-free",
+    "nemotron-3-ultra-free",
+    "longcat-2.5-preview-free",
+]
+
+
+class SelectionError(RuntimeError):
+    pass
+
+
+def launcher_config_path() -> Path:
+    root = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(root) if root else Path.home() / ".config"
+    return base / "opencode-smart-launcher" / "config.json"
+
+
+def find_real_binary() -> str:
+    configured: list[str] = []
+    if os.environ.get("OPENCODE_REAL_BINARY"):
+        configured.append(os.environ["OPENCODE_REAL_BINARY"])
+    try:
+        config = json.loads(launcher_config_path().read_text(encoding="utf-8"))
+        if isinstance(config, dict) and isinstance(config.get("real_binary"), str):
+            configured.append(config["real_binary"])
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    configured.append(str(Path.home() / ".opencode" / "bin" / "opencode"))
+    discovered = shutil.which("opencode")
+    if discovered:
+        configured.append(discovered)
+
+    launcher = Path(__file__).resolve()
+    for value in configured:
+        candidate = Path(value).expanduser()
+        try:
+            if candidate.is_file() and candidate.resolve() != launcher:
+                return str(candidate.resolve())
+        except OSError:
+            continue
+    raise SelectionError(
+        "real OpenCode binary not found; rerun the smart-launcher installer or set OPENCODE_REAL_BINARY"
+    )
+
+
+def cache_dir() -> Path:
+    root = os.environ.get("XDG_CACHE_HOME")
+    return Path(root) / "opencode-free-launcher" if root else Path.home() / ".cache" / "opencode-free-launcher"
+
+
+def cache_path() -> Path:
+    return cache_dir() / "selection.json"
+
+
+def fetch_text(url: str, timeout: float = 12.0) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "argus-opencode-free-launcher/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8")
+
+
+def free_candidates(catalog: dict[str, Any]) -> list[dict[str, Any]]:
+    provider = catalog.get("opencode")
+    if not isinstance(provider, dict):
+        raise SelectionError("Models.dev did not return the OpenCode Zen provider")
+    models = provider.get("models")
+    if not isinstance(models, dict):
+        raise SelectionError("Models.dev returned an invalid OpenCode Zen catalog")
+
+    result: list[dict[str, Any]] = []
+    for model_id, raw in models.items():
+        if not isinstance(raw, dict):
+            continue
+        cost = raw.get("cost")
+        if not isinstance(cost, dict) or cost.get("input") != 0 or cost.get("output") != 0:
+            continue
+        if raw.get("tool_call") is not True or raw.get("status") == "deprecated":
+            continue
+        if str(model_id).startswith("jev-"):
+            continue
+        result.append(
+            {
+                "id": str(model_id),
+                "name": str(raw.get("name") or model_id),
+                "context": int((raw.get("limit") or {}).get("context") or 0),
+            }
+        )
+    if not result:
+        raise SelectionError("No tool-capable zero-cost OpenCode Zen models are currently listed")
+    return result
+
+
+def usage_scores(html: str) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    # The public page embeds both daily and weekly leaderboard rows. Keeping the
+    # largest token value for each model reliably selects the weekly figure.
+    pattern = re.compile(
+        r'model:"(?P<model>[a-zA-Z0-9._-]+)"[^{}]{0,220}?tokens:(?P<tokens>[0-9.]+)[^{}]{0,120}?rank:[0-9]+'
+    )
+    for match in pattern.finditer(html):
+        model = match.group("model")
+        tokens = float(match.group("tokens"))
+        scores[model] = max(scores.get(model, 0.0), tokens)
+    return scores
+
+
+def usage_key(model_id: str) -> str:
+    if model_id.endswith("-contributor-free"):
+        return model_id[: -len("-free")]
+    if model_id.endswith("-free"):
+        return model_id[: -len("-free")]
+    return model_id
+
+
+def rank_candidates_by_usage(candidates: list[dict[str, Any]], scores: dict[str, float]) -> tuple[dict[str, Any], str]:
+    scored = [(scores.get(usage_key(item["id"]), 0.0), item) for item in candidates]
+    best_score, best = max(scored, key=lambda pair: (pair[0], pair[1]["context"], pair[1]["id"]))
+    if best_score > 0:
+        return best, "OpenCode public weekly usage"
+
+    by_id = {item["id"]: item for item in candidates}
+    for model_id in FALLBACK_PREFERENCE:
+        if model_id in by_id:
+            return by_id[model_id], "verified fallback preference"
+    return max(candidates, key=lambda item: (item["context"], item["id"])), "verified context-size fallback"
+
+
+def model_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def ebbwater_snapshot(html: str, now: float) -> tuple[dict[str, dict[str, Any]], str]:
+    updated_match = re.search(r'var AA_UPDATED = "([^"]+)";', html)
+    roster_match = re.search(r"var ZEN = (\[.*?\]);\s*/\* Coding Agent Index", html, re.DOTALL)
+    if not updated_match or not roster_match:
+        raise SelectionError("Ebbwater page did not contain the expected AA snapshot")
+
+    updated_at = updated_match.group(1)
+    try:
+        updated_epoch = datetime.fromisoformat(updated_at.replace("Z", "+00:00")).timestamp()
+        roster = json.loads(roster_match.group(1))
+    except (ValueError, json.JSONDecodeError) as error:
+        raise SelectionError(f"Ebbwater AA snapshot was invalid: {error}") from error
+    age = now - updated_epoch
+    if age < -300 or age > EBBWATER_MAX_AGE_SECONDS:
+        raise SelectionError(f"Ebbwater AA snapshot is stale ({max(0, int(age // 3600))} hours old)")
+
+    scores: dict[str, dict[str, Any]] = {}
+    for row in roster:
+        if not isinstance(row, list) or len(row) < 3 or not isinstance(row[0], str):
+            continue
+        aa_index, aa_position = row[1], row[2]
+        if not isinstance(aa_index, (int, float)):
+            continue
+        scores[model_key(row[0])] = {
+            "aa_index": aa_index,
+            "aa_position": aa_position if isinstance(aa_position, (int, float)) else None,
+            "ebbwater_name": row[0],
+        }
+    return scores, updated_at
+
+
+def ebbwater_score_for(candidate: dict[str, Any], scores: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    keys = {model_key(candidate["id"]), model_key(candidate["name"])}
+    if candidate["id"] == "muse-spark-1.3-contributor-free":
+        keys.add(model_key("Muse Spark 1.3 Contributor Free"))
+    for key in keys:
+        if key in scores:
+            return scores[key]
+    return None
+
+
+def rank_candidates_by_aa(
+    candidates: list[dict[str, Any]], scores: dict[str, dict[str, Any]]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    matched = [(ebbwater_score_for(item, scores), item) for item in candidates]
+    matched = [(score, item) for score, item in matched if score is not None]
+    if not matched:
+        raise SelectionError("Ebbwater has no AA scores matching the current free models")
+    score, selected = max(
+        matched,
+        key=lambda pair: (
+            pair[0]["aa_index"],
+            -(pair[0]["aa_position"] or 10**9),
+            pair[1]["context"],
+            pair[1]["id"],
+        ),
+    )
+    return selected, score
+
+
+def read_cache() -> dict[str, Any] | None:
+    try:
+        value = json.loads(cache_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def cache_is_fresh(value: dict[str, Any], now: float) -> bool:
+    ttl = FALLBACK_CACHE_TTL_SECONDS if value.get("ranking_source") == "fallback" else CACHE_TTL_SECONDS
+    return (
+        isinstance(value.get("model"), str)
+        and isinstance(value.get("selected_at"), (int, float))
+        and now - float(value["selected_at"]) < ttl
+    )
+
+
+def write_cache(value: dict[str, Any]) -> None:
+    directory = cache_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = directory / f"selection.{os.getpid()}.tmp"
+    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(cache_path())
+
+
+def refresh_selection(now: float) -> dict[str, Any]:
+    try:
+        catalog = json.loads(fetch_text(CATALOG_URL))
+    except (json.JSONDecodeError, OSError, urllib.error.URLError) as error:
+        raise SelectionError(f"could not refresh the live model catalog: {error}") from error
+    if not isinstance(catalog, dict):
+        raise SelectionError("the live model catalog was not a JSON object")
+
+    candidates = free_candidates(catalog)
+    selection_details: dict[str, Any]
+    try:
+        aa_scores, source_updated_at = ebbwater_snapshot(fetch_text(EBBWATER_URL), now)
+        selected, aa = rank_candidates_by_aa(candidates, aa_scores)
+        selection_details = {
+            "basis": "Ebbwater AA Index",
+            "ranking_source": "ebbwater-aa",
+            "source_updated_at": source_updated_at,
+            "aa_index": aa["aa_index"],
+            "aa_position": aa["aa_position"],
+        }
+    except (OSError, urllib.error.URLError, SelectionError) as error:
+        fallback_reason = str(error)
+        try:
+            usage = usage_scores(fetch_text(STATS_URL))
+        except (OSError, urllib.error.URLError):
+            usage = {}
+        selected, fallback_basis = rank_candidates_by_usage(candidates, usage)
+        selection_details = {
+            "basis": f"FALLBACK: {fallback_basis}",
+            "ranking_source": "fallback",
+            "fallback_reason": fallback_reason,
+        }
+    return {
+        "schema": 1,
+        "model": f"opencode/{selected['id']}",
+        "name": selected["name"],
+        **selection_details,
+        "candidate_count": len(candidates),
+        "selected_at": now,
+    }
+
+
+def print_status(selection: dict[str, Any]) -> None:
+    fallback = selection.get("ranking_source") == "fallback"
+    print("OpenCode free-model status")
+    print(f"Health: {'DEGRADED - FALLBACK ACTIVE' if fallback else 'OK - Ebbwater AA ranking active'}")
+    print(f"Model: {selection['name']} ({selection['model']})")
+    print(f"Ranking: {selection['basis']}")
+    if selection.get("aa_index") is not None:
+        position = selection.get("aa_position")
+        suffix = f" (AA position #{position})" if position is not None else ""
+        print(f"AA index: {selection['aa_index']}{suffix}")
+    if selection.get("source_updated_at"):
+        print(f"Ebbwater snapshot: {selection['source_updated_at']}")
+    if selection.get("fallback_reason"):
+        print(f"Fallback reason: {selection['fallback_reason']}")
+    checked = datetime.fromtimestamp(float(selection["selected_at"]), timezone.utc).isoformat()
+    print(f"Selection checked: {checked}")
+    print(f"Cache: {selection.get('cache', 'unknown')}")
+
+
+def select_model(force_refresh: bool = False) -> dict[str, Any]:
+    directory = cache_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = directory / "selection.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        now = time.time()
+        cached = read_cache()
+        if not force_refresh and cached and cache_is_fresh(cached, now):
+            return {**cached, "cache": "fresh"}
+        try:
+            refreshed = refresh_selection(now)
+        except SelectionError:
+            # A selection less than 24 hours old was verified recently enough to
+            # remain safe during a transient refresh failure. Older values fail
+            # closed rather than risk silently launching a newly-paid model.
+            if cached and cache_is_fresh(cached, now):
+                return {**cached, "cache": "refresh-failed"}
+            raise
+        write_cache(refreshed)
+        return {**refreshed, "cache": "refreshed"}
+
+
+def is_resume(args: list[str]) -> bool:
+    return any(arg in RESUME_FLAGS for arg in args)
+
+
+def is_noninteractive_command(args: list[str]) -> bool:
+    if any(arg in PASSTHROUGH_FLAGS for arg in args):
+        return True
+    for arg in args:
+        if arg == "--":
+            return False
+        if arg.startswith("-"):
+            continue
+        return arg in SUBCOMMANDS
+    return False
+
+
+def config_content_with_model(model: str) -> str:
+    raw = os.environ.get("OPENCODE_CONFIG_CONTENT", "")
+    if not raw:
+        config: dict[str, Any] = {}
+    else:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise SelectionError(f"OPENCODE_CONFIG_CONTENT is invalid JSON: {error}") from error
+        if not isinstance(parsed, dict):
+            raise SelectionError("OPENCODE_CONFIG_CONTENT must be a JSON object")
+        config = parsed
+    config["model"] = model
+    return json.dumps(config, separators=(",", ":"))
+
+
+def target_directory(args: list[str]) -> str:
+    flags_with_values = {"--server", "--prompt", "--log-level", "--session", "-s"}
+    skip_next = False
+    for index, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in flags_with_values:
+            skip_next = True
+            continue
+        if arg == "--" and index + 1 < len(args):
+            return str(Path(args[index + 1]).expanduser().resolve())
+        if not arg.startswith("-"):
+            return str(Path(arg).expanduser().resolve())
+    return str(Path.cwd().resolve())
+
+
+def create_explicit_session(binary: str, model: str, directory: str) -> str:
+    try:
+        provider_id, model_id = model.split("/", 1)
+    except ValueError as error:
+        raise SelectionError(f"invalid selected model reference: {model}") from error
+    payload = json.dumps(
+        {
+            "model": {"providerID": provider_id, "id": model_id},
+            "location": {"directory": directory},
+        },
+        separators=(",", ":"),
+    )
+    try:
+        result = subprocess.run(
+            [binary, "api", "session.create", "--data", payload],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        response = json.loads(result.stdout)
+        session = response["data"]
+        session_id = session["id"]
+        selected = session.get("model") or {}
+    except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, TypeError) as error:
+        detail = getattr(error, "stderr", "") or str(error)
+        raise SelectionError(f"could not create an explicit-model OpenCode session: {detail.strip()}") from error
+    if selected.get("providerID") != provider_id or selected.get("id") != model_id:
+        raise SelectionError("OpenCode created the session with a different model than requested")
+    if not isinstance(session_id, str) or not session_id.startswith("ses"):
+        raise SelectionError("OpenCode returned an invalid session ID")
+    return session_id
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    dry_run = "--smart-free-dry-run" in args
+    status = "--smart-free-status" in args
+    force_refresh = "--smart-free-refresh" in args
+    args = [
+        arg
+        for arg in args
+        if arg not in {"--smart-free-dry-run", "--smart-free-status", "--smart-free-refresh"}
+    ]
+
+    try:
+        binary = find_real_binary()
+    except SelectionError as error:
+        print(f"OpenCode free launcher: {error}", file=sys.stderr)
+        return 127
+
+    if is_resume(args) or is_noninteractive_command(args):
+        if dry_run:
+            print(json.dumps({"action": "passthrough", "args": args}))
+            return 0
+        os.execv(binary, [binary, *args])
+
+    try:
+        selection = select_model(force_refresh=force_refresh)
+        content = config_content_with_model(selection["model"])
+    except SelectionError as error:
+        print(f"OpenCode free launcher: {error}", file=sys.stderr)
+        print("Refusing to launch with an unverified or potentially paid model.", file=sys.stderr)
+        return 2
+
+    if dry_run:
+        print(json.dumps({"action": "launch", **selection}, indent=2))
+        return 0
+    if status:
+        print_status(selection)
+        return 0
+
+    # The V2 TUI connects to a shared background service. Inline config belongs
+    # to the server process, so setting it only on the TUI client cannot change
+    # that service's default. Create the new session with an explicit model and
+    # open that exact session instead. Resume requests remain untouched above.
+    if "--standalone" not in args and "--server" not in args:
+        try:
+            session_id = create_explicit_session(binary, selection["model"], target_directory(args))
+        except SelectionError as error:
+            print(f"OpenCode free launcher: {error}", file=sys.stderr)
+            print("Refusing to launch a session whose free model cannot be enforced.", file=sys.stderr)
+            return 2
+        args = ["--session", session_id, *args]
+
+    if selection.get("ranking_source") == "fallback":
+        print("WARNING: Ebbwater AA ranking unavailable - FALLBACK ACTIVE.", file=sys.stderr)
+        print(f"Reason: {selection.get('fallback_reason', 'unknown')}", file=sys.stderr)
+    else:
+        print(
+            f"Ebbwater AA ranking active: index {selection.get('aa_index')} "
+            f"(snapshot {selection.get('source_updated_at')}).",
+            file=sys.stderr,
+        )
+    print(
+        f"OpenCode free launcher: {selection['name']} ({selection['model']}) "
+        f"via {selection['basis']} [{selection['cache']}].", file=sys.stderr
+    )
+    print("Free-model session: do not submit private or confidential material.", file=sys.stderr)
+    environment = os.environ.copy()
+    environment["OPENCODE_CONFIG_CONTENT"] = content
+    os.execve(binary, [binary, *args], environment)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
