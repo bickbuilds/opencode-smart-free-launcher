@@ -94,7 +94,7 @@ function Install-OfficialOpenCode {
         } catch { $target += "-baseline" }
     }
 
-    Write-Output "OpenCode was not found; locating the latest official V2 Windows build..."
+    [Console]::WriteLine("OpenCode was not found; locating the latest official V2 Windows build...")
     $latest = Invoke-RestMethod -Uri "https://opencode.ai/update/api/latest/cli/npm" -TimeoutSec 30
     $version = [string]$latest.version
     $basePackage = [string]$latest.metadata.package
@@ -125,11 +125,13 @@ function Install-OfficialOpenCode {
     } finally {
         if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
     }
-    return (Join-Path $ManagedOpenCodeDir "opencode.exe")
 }
 
 $RealBinary = Find-ExistingOpenCode
-if (-not $RealBinary) { $RealBinary = Install-OfficialOpenCode }
+if (-not $RealBinary) {
+    Install-OfficialOpenCode
+    $RealBinary = Join-Path $ManagedOpenCodeDir "opencode.exe"
+}
 
 $versionOutput = (& $RealBinary --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or -not $versionOutput) { throw "Detected OpenCode executable did not run: $RealBinary" }

@@ -15,6 +15,11 @@ $function = $ast.Find({
 if (-not $function) { throw "Get-WindowsArchitecture was not found" }
 Invoke-Expression $function.Extent.Text
 
+$source = Get-Content -LiteralPath $installer -Raw
+if ($source -match '(?im)^\s*\$RealBinary\s*=\s*Install-OfficialOpenCode') {
+    throw "Install-OfficialOpenCode output must not be captured as the executable path"
+}
+
 $originalNative = $env:PROCESSOR_ARCHITEW6432
 $originalProcess = $env:PROCESSOR_ARCHITECTURE
 try {
@@ -36,4 +41,4 @@ try {
     $env:PROCESSOR_ARCHITECTURE = $originalProcess
 }
 
-Write-Output "Windows installer architecture tests passed."
+Write-Output "Windows installer compatibility tests passed."
