@@ -216,6 +216,18 @@ function Get-TargetDirectory([string[]]$Arguments) {
     return (Get-Location).Path
 }
 
+function ConvertTo-NativeJsonArgument([string]$Json) {
+    # Windows PowerShell 5.1 and PowerShell's pre-7.3 native argument mode
+    # remove embedded quotes when constructing an executable command line.
+    # OpenCode then receives invalid JSON. Modern Windows/Standard mode keeps
+    # the quotes and must receive the original string.
+    $mode = Get-Variable -Name PSNativeCommandArgumentPassing -Scope Global -ErrorAction SilentlyContinue
+    if ($null -eq $mode -or [string]$mode.Value -eq "Legacy") {
+        return $Json.Replace('"', '\"')
+    }
+    return $Json
+}
+
 function Show-Status($Selection) {
     $fallback = $Selection.ranking_source -eq "fallback"
     Write-Output "OpenCode free-model status"
@@ -250,7 +262,8 @@ try {
         model = @{ providerID = $parts[0]; id = $parts[1] }
         location = @{ directory = (Get-TargetDirectory $Arguments) }
     } | ConvertTo-Json -Compress -Depth 5
-    $raw = (& $RealBinary api session.create --data $payload | Out-String)
+    $nativePayload = ConvertTo-NativeJsonArgument $payload
+    $raw = (& $RealBinary api session.create --data $nativePayload | Out-String)
     if ($LASTEXITCODE -ne 0) { throw "OpenCode session API exited with code $LASTEXITCODE" }
     $session = ($raw | ConvertFrom-Json).data
     if ($session.model.providerID -ne $parts[0] -or $session.model.id -ne $parts[1]) { throw "OpenCode created the session with a different model than requested" }
