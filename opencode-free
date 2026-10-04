@@ -20,10 +20,23 @@ from typing import Any
 
 CATALOG_URL = "https://models.dev/api.json"
 STATS_URL = "https://stats.opencode.ai/"
-EBBWATER_URL = "https://www.ebbwater.net/tools/opencode"
+AA_API_URL = "https://artificialanalysis.ai/api/v2/language/models/free"
+AA_API_KEY_ENV = "ARTIFICIAL_ANALYSIS_API_KEY"
 CACHE_TTL_SECONDS = 24 * 60 * 60
 FALLBACK_CACHE_TTL_SECONDS = 60 * 60
-EBBWATER_MAX_AGE_SECONDS = 3 * 24 * 60 * 60
+AA_PAGE_SIZE = 200
+# The Coding Agent Index is the closest published analogue to how this launcher
+# ranks: it weights DeepSWE, Terminal-Bench 4.0 and SWE-Atlas-QnA. Each entry is
+# tried in order, so a model missing the preferred index still ranks on the next
+# one rather than dropping out of contention entirely.
+AA_INDEX_FIELDS = (
+    "artificial_analysis_coding_index",
+    "artificial_analysis_agentic_index",
+    "artificial_analysis_intelligence_index",
+)
+# Zen-only distribution qualifiers, peeled off when matching a Zen id against a
+# benchmark publisher's model name.
+AA_ID_SUFFIXES = ("-free", "-preview", "-contributor")
 SUBCOMMANDS = {
     "acp",
     "api",
@@ -108,13 +121,21 @@ def cache_path() -> Path:
     return cache_dir() / "selection.json"
 
 
-def fetch_text(url: str, timeout: float = 12.0) -> str:
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "argus-opencode-free-launcher/1.0"},
-    )
+def fetch_text(url: str, timeout: float = 12.0, headers: dict[str, str] | None = None) -> str:
+    request_headers = {"User-Agent": "argus-opencode-free-launcher/1.0"}
+    request_headers.update(headers or {})
+    request = urllib.request.Request(url, headers=request_headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read().decode("utf-8")
+
+
+def aa_api_key() -> str:
+    key = os.environ.get(AA_API_KEY_ENV, "").strip()
+    if not key:
+        raise SelectionError(
+            f"{AA_API_KEY_ENV} is not set; get a free key at https://artificialanalysis.ai/data-api"
+        )
+    return key
 
 
 def free_candidates(catalog: dict[str, Any]) -> list[dict[str, Any]]:
@@ -187,42 +208,106 @@ def model_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
-def ebbwater_snapshot(html: str, now: float) -> tuple[dict[str, dict[str, Any]], str]:
-    updated_match = re.search(r'var AA_UPDATED = "([^"]+)";', html)
-    roster_match = re.search(r"var ZEN = (\[.*?\]);\s*/\* Coding Agent Index", html, re.DOTALL)
-    if not updated_match or not roster_match:
-        raise SelectionError("Ebbwater page did not contain the expected AA snapshot")
+def aa_index_payload() -> dict[str, Any]:
+    """Fetch every page of the free-tier Artificial Analysis model list."""
+    headers = {"x-api-key": aa_api_key(), "Accept": "application/json"}
+    collected: list[dict[str, Any]] = []
+    version: Any = None
+    page = 1
+    while True:
+        separator = "&" if "?" in AA_API_URL else "?"
+        url = f"{AA_API_URL}{separator}page={page}&page_size={AA_PAGE_SIZE}"
+        try:
+            body = json.loads(fetch_text(url, timeout=20.0, headers=headers))
+        except json.JSONDecodeError as error:
+            raise SelectionError(f"Artificial Analysis returned invalid JSON: {error}") from error
+        if not isinstance(body, dict):
+            raise SelectionError("Artificial Analysis returned an unexpected payload shape")
 
-    updated_at = updated_match.group(1)
-    try:
-        updated_epoch = datetime.fromisoformat(updated_at.replace("Z", "+00:00")).timestamp()
-        roster = json.loads(roster_match.group(1))
-    except (ValueError, json.JSONDecodeError) as error:
-        raise SelectionError(f"Ebbwater AA snapshot was invalid: {error}") from error
-    age = now - updated_epoch
-    if age < -300 or age > EBBWATER_MAX_AGE_SECONDS:
-        raise SelectionError(f"Ebbwater AA snapshot is stale ({max(0, int(age // 3600))} hours old)")
+        rows = body.get("data")
+        if not isinstance(rows, list):
+            raise SelectionError("Artificial Analysis response had no model list")
+        collected.extend(row for row in rows if isinstance(row, dict))
 
+        pagination = body.get("pagination")
+        if not isinstance(pagination, dict):
+            raise SelectionError("Artificial Analysis response had no pagination block")
+        version = body.get("intelligence_index_version", version)
+
+        if not pagination.get("has_more"):
+            break
+        page += 1
+        if page > 50:
+            raise SelectionError("Artificial Analysis pagination did not terminate")
+
+    if not collected:
+        raise SelectionError("Artificial Analysis returned no language models")
+    return {"models": collected, "intelligence_index_version": version}
+
+
+def aa_index_snapshot() -> tuple[dict[str, dict[str, Any]], Any]:
+    """Return AA scores keyed by normalised name, plus the reported index version.
+
+    Freshness is implicit: this is a live API call, so the existing 24h selection
+    cache bounds how old a decision can be. There is no page timestamp to police,
+    which is what previously forced a hard fallback when a third-party mirror went
+    quiet.
+    """
+    payload = aa_index_payload()
     scores: dict[str, dict[str, Any]] = {}
-    for row in roster:
-        if not isinstance(row, list) or len(row) < 3 or not isinstance(row[0], str):
+    for row in payload["models"]:
+        evaluations = row.get("evaluations")
+        if not isinstance(evaluations, dict):
             continue
-        aa_index, aa_position = row[1], row[2]
-        if not isinstance(aa_index, (int, float)):
-            continue
-        scores[model_key(row[0])] = {
-            "aa_index": aa_index,
-            "aa_position": aa_position if isinstance(aa_position, (int, float)) else None,
-            "ebbwater_name": row[0],
+        indices = {
+            name: float(evaluations[name])
+            for name in AA_INDEX_FIELDS
+            if isinstance(evaluations.get(name), (int, float))
+            and not isinstance(evaluations.get(name), bool)
         }
-    return scores, updated_at
+        if not indices:
+            continue
+        for raw_name in (row.get("name"), row.get("slug")):
+            if isinstance(raw_name, str) and raw_name:
+                scores.setdefault(
+                    model_key(raw_name), {"aa_name": raw_name, "indices": dict(indices)}
+                )
+    if not scores:
+        raise SelectionError("Artificial Analysis returned no usable index scores")
+    return scores, payload["intelligence_index_version"]
 
 
-def ebbwater_score_for(candidate: dict[str, Any], scores: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-    keys = {model_key(candidate["id"]), model_key(candidate["name"])}
-    if candidate["id"] == "muse-spark-1.3-contributor-free":
-        keys.add(model_key("Muse Spark 1.3 Contributor Free"))
-    for key in keys:
+def aa_match_keys(candidate: dict[str, Any]) -> list[str]:
+    """Normalised keys a Zen model id can legitimately match on.
+
+    Zen appends distribution qualifiers the benchmark publisher has no reason to
+    know about ("-free", "-preview-free", "-contributor-free"), so each tier is
+    peeled off in turn and every intermediate form is offered as a candidate key.
+    This replaces a hardcoded alias for a single Muse model.
+    """
+    # Try both exact identifiers before stripping either one. Each subsequent
+    # tier removes one distribution qualifier; variant names remain intact.
+    current = [
+        re.sub(r"\s+", "-", str(candidate.get(field) or "").strip().lower())
+        for field in ("id", "name")
+    ]
+    keys: list[str] = []
+    while current:
+        stripped = []
+        for value in current:
+            key = model_key(value)
+            if key and key not in keys:
+                keys.append(key)
+            for suffix in AA_ID_SUFFIXES:
+                if value.endswith(suffix):
+                    stripped.append(value[: -len(suffix)])
+                    break
+        current = stripped
+    return keys
+
+
+def aa_score_for(candidate: dict[str, Any], scores: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    for key in aa_match_keys(candidate):
         if key in scores:
             return scores[key]
     return None
@@ -231,20 +316,41 @@ def ebbwater_score_for(candidate: dict[str, Any], scores: dict[str, dict[str, An
 def rank_candidates_by_aa(
     candidates: list[dict[str, Any]], scores: dict[str, dict[str, Any]]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    matched = [(ebbwater_score_for(item, scores), item) for item in candidates]
+    matched = [(aa_score_for(item, scores), item) for item in candidates]
     matched = [(score, item) for score, item in matched if score is not None]
     if not matched:
-        raise SelectionError("Ebbwater has no AA scores matching the current free models")
-    score, selected = max(
-        matched,
-        key=lambda pair: (
-            pair[0]["aa_index"],
-            -(pair[0]["aa_position"] or 10**9),
-            pair[1]["context"],
-            pair[1]["id"],
-        ),
-    )
-    return selected, score
+        raise SelectionError("Artificial Analysis has no index scores matching the current free models")
+
+    # Rank on a single index across all candidates. The Coding, Agentic and
+    # Intelligence indices are separately calibrated, so mixing them in one
+    # comparison would compare incomparable numbers. The first field that covers
+    # any candidate wins, and only candidates carrying that field compete.
+    for field in AA_INDEX_FIELDS:
+        ranked = [
+            (score["indices"][field], item, score["aa_name"])
+            for score, item in matched
+            if field in score["indices"]
+        ]
+        if not ranked:
+            continue
+        value, selected, publisher_name = max(
+            ranked, key=lambda triple: (triple[0], triple[1]["context"], triple[1]["id"])
+        )
+        scored_ids = {item["id"] for _, item, _ in ranked}
+        any_matched_ids = {item["id"] for _, item in matched}
+        return selected, {
+            "aa_index": value,
+            "aa_field": field,
+            "aa_name": publisher_name,
+            "scored_count": len(scored_ids),
+            "benchmarked_count": len(any_matched_ids),
+            # Every free candidate the publisher did not score at all, so a
+            # popular but unbenchmarked model is disclosed rather than dropped.
+            "unscored_ids": sorted(
+                item["id"] for item in candidates if item["id"] not in any_matched_ids
+            ),
+        }
+    raise SelectionError("Artificial Analysis returned no comparable index scores")
 
 
 def read_cache() -> dict[str, Any] | None:
@@ -258,7 +364,8 @@ def read_cache() -> dict[str, Any] | None:
 def cache_is_fresh(value: dict[str, Any], now: float) -> bool:
     ttl = FALLBACK_CACHE_TTL_SECONDS if value.get("ranking_source") == "fallback" else CACHE_TTL_SECONDS
     return (
-        isinstance(value.get("model"), str)
+        value.get("ranking_source") in ("aa-api", "fallback")
+        and isinstance(value.get("model"), str)
         and isinstance(value.get("selected_at"), (int, float))
         and now - float(value["selected_at"]) < ttl
     )
@@ -284,14 +391,19 @@ def refresh_selection(now: float) -> dict[str, Any]:
     candidates = free_candidates(catalog)
     selection_details: dict[str, Any]
     try:
-        aa_scores, source_updated_at = ebbwater_snapshot(fetch_text(EBBWATER_URL), now)
+        aa_scores, index_version = aa_index_snapshot()
         selected, aa = rank_candidates_by_aa(candidates, aa_scores)
         selection_details = {
-            "basis": "Ebbwater AA Index",
-            "ranking_source": "ebbwater-aa",
-            "source_updated_at": source_updated_at,
+            "basis": f"Artificial Analysis {aa['aa_field'].removeprefix('artificial_analysis_').removesuffix('_index')}",
+            "ranking_source": "aa-api",
+            "intelligence_index_version": index_version,
             "aa_index": aa["aa_index"],
-            "aa_position": aa["aa_position"],
+            "aa_field": aa["aa_field"],
+            "aa_name": aa["aa_name"],
+            "ranked_count": aa["scored_count"],
+            "benchmarked_count": aa["benchmarked_count"],
+            "candidate_count": len(candidates),
+            "unscored_ids": aa["unscored_ids"],
         }
     except (OSError, urllib.error.URLError, SelectionError) as error:
         fallback_reason = str(error)
@@ -318,17 +430,25 @@ def refresh_selection(now: float) -> dict[str, Any]:
 def print_status(selection: dict[str, Any]) -> None:
     fallback = selection.get("ranking_source") == "fallback"
     print("OpenCode free-model status")
-    print(f"Health: {'DEGRADED - FALLBACK ACTIVE' if fallback else 'OK - Ebbwater AA ranking active'}")
+    print(f"Health: {'DEGRADED - FALLBACK ACTIVE' if fallback else 'OK - Artificial Analysis ranking active'}")
     print(f"Model: {selection['name']} ({selection['model']})")
     print(f"Ranking: {selection['basis']}")
     if selection.get("aa_index") is not None:
-        position = selection.get("aa_position")
-        suffix = f" (AA position #{position})" if position is not None else ""
-        print(f"AA index: {selection['aa_index']}{suffix}")
-    if selection.get("source_updated_at"):
-        print(f"Ebbwater snapshot: {selection['source_updated_at']}")
+        field = selection.get("aa_field") or "index"
+        print(f"AA index: {selection['aa_index']} (source: {field})")
+    if selection.get("intelligence_index_version") is not None:
+        print(f"AA Intelligence Index version: {selection['intelligence_index_version']}")
+    unscored = selection.get("unscored_ids")
+    if unscored:
+        # A successful ranking says nothing about models the publisher has not
+        # scored, so surface them rather than implying full coverage.
+        benchmarked = selection.get("benchmarked_count")
+        total = selection.get("candidate_count")
+        if benchmarked and total:
+            print(f"Coverage: {benchmarked} of {total} free models scored by AA")
+        print(f"Not scored by AA ({len(unscored)}): {', '.join(unscored)}")
     if selection.get("fallback_reason"):
-        print(f"Fallback reason: {selection['fallback_reason']}")
+        print(f"Fallback reason: {selection.get('fallback_reason')}")
     checked = datetime.fromtimestamp(float(selection["selected_at"]), timezone.utc).isoformat()
     print(f"Selection checked: {checked}")
     print(f"Cache: {selection.get('cache', 'unknown')}")
@@ -492,12 +612,12 @@ def main() -> int:
         args = ["--session", session_id, *args]
 
     if selection.get("ranking_source") == "fallback":
-        print("WARNING: Ebbwater AA ranking unavailable - FALLBACK ACTIVE.", file=sys.stderr)
+        print("WARNING: Artificial Analysis ranking unavailable - FALLBACK ACTIVE.", file=sys.stderr)
         print(f"Reason: {selection.get('fallback_reason', 'unknown')}", file=sys.stderr)
     else:
         print(
-            f"Ebbwater AA ranking active: index {selection.get('aa_index')} "
-            f"(snapshot {selection.get('source_updated_at')}).",
+            f"Artificial Analysis ranking active: {selection.get('aa_index')} "
+            f"({selection.get('aa_field')}, index v{selection.get('intelligence_index_version')}).",
             file=sys.stderr,
         )
     print(
