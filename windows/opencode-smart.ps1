@@ -3,10 +3,18 @@ Set-StrictMode -Version 2
 
 $CatalogUrl = "https://models.dev/api.json"
 $StatsUrl = "https://stats.opencode.ai/"
-$EbbwaterUrl = "https://www.ebbwater.net/tools/opencode"
+$AaApiUrl = "https://artificialanalysis.ai/api/v2/language/models/free"
+$AaApiKeyEnv = "ARTIFICIAL_ANALYSIS_API_KEY"
+$AaPageSize = 200
 $HealthyTtlSeconds = 24 * 60 * 60
 $FallbackTtlSeconds = 60 * 60
-$EbbwaterMaxAgeSeconds = 3 * 24 * 60 * 60
+# The Coding Agent Index is the closest published analogue to how this launcher
+# ranks: it weights DeepSWE, Terminal-Bench 4.0 and SWE-Atlas-QnA. Each entry is
+# tried in order, so a model missing the preferred index still ranks on the next.
+$AaIndexFields = @("artificial_analysis_coding_index", "artificial_analysis_agentic_index", "artificial_analysis_intelligence_index")
+# Zen-only distribution qualifiers, peeled off when matching a Zen id against a
+# benchmark publisher's model name.
+$AaIdSuffixes = @("-free", "-preview", "-contributor", "-lightning", "-flash", "-tiny")
 $ConfigPath = Join-Path $env:LOCALAPPDATA "opencode-smart-launcher\config.json"
 $CacheDir = Join-Path $env:LOCALAPPDATA "opencode-free-launcher"
 $CachePath = Join-Path $CacheDir "selection.json"
@@ -56,48 +64,128 @@ function Get-FreeCandidates($Catalog) {
     return $result
 }
 
-function Get-EbbwaterSnapshot([string]$Html, [DateTimeOffset]$Now) {
-    $updatedMatch = [regex]::Match($Html, 'var AA_UPDATED = "([^"]+)";')
-    $rosterMatch = [regex]::Match($Html, 'var ZEN = (\[.*?\]);\s*/\* Coding Agent Index', [Text.RegularExpressions.RegexOptions]::Singleline)
-    if (-not $updatedMatch.Success -or -not $rosterMatch.Success) { throw "Ebbwater page did not contain the expected AA snapshot" }
-    $updated = [DateTimeOffset]::Parse($updatedMatch.Groups[1].Value)
-    $age = ($Now - $updated).TotalSeconds
-    if ($age -lt -300 -or $age -gt $EbbwaterMaxAgeSeconds) { throw "Ebbwater AA snapshot is stale ($([math]::Max(0, [math]::Floor($age / 3600))) hours old)" }
+function Get-AaApiKey {
+    $value = [string][Environment]::GetEnvironmentVariable($AaApiKeyEnv)
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "$AaApiKeyEnv is not set; get a free key at https://artificialanalysis.ai/data-api"
+    }
+    return $value.Trim()
+}
+
+function Get-AaIndexPayload {
+    $headers = @{ "x-api-key" = (Get-AaApiKey); "Accept" = "application/json" }
+    $models = @()
+    $version = $null
+    $page = 1
+    while ($true) {
+        $url = "$AaApiUrl`?page=$page&page_size=$AaPageSize"
+        $body = Invoke-RestMethod -Uri $url -Headers $headers -TimeoutSec 20
+        if ($null -eq $body.data) { throw "Artificial Analysis response had no model list" }
+        $models += @($body.data)
+        if ($null -ne $body.intelligence_index_version) { $version = $body.intelligence_index_version }
+        if ($null -eq $body.pagination) { throw "Artificial Analysis response had no pagination block" }
+        if (-not $body.pagination.has_more) { break }
+        $page++
+        if ($page -gt 50) { throw "Artificial Analysis pagination did not terminate" }
+    }
+    if ($models.Count -eq 0) { throw "Artificial Analysis returned no language models" }
+    return [pscustomobject]@{ models = $models; intelligence_index_version = $version }
+}
+
+function Get-AaIndexSnapshot {
+    # Freshness is implicit: this is a live API call, so the existing 24h selection
+    # cache bounds how old a decision can be. There is no page timestamp to police,
+    # which is what previously forced a hard fallback when a mirror went quiet.
+    $payload = Get-AaIndexPayload
     $scores = @{}
-    foreach ($row in ($rosterMatch.Groups[1].Value | ConvertFrom-Json)) {
-        if ($row.Count -lt 3 -or $null -eq $row[1]) { continue }
-        $scores[(Get-ModelKey ([string]$row[0]))] = [pscustomobject]@{
-            aa_index = [double]$row[1]
-            aa_position = if ($null -ne $row[2]) { [double]$row[2] } else { $null }
+    foreach ($row in $payload.models) {
+        $evaluationsProperty = $row.PSObject.Properties["evaluations"]
+        if ($null -eq $evaluationsProperty -or $null -eq $evaluationsProperty.Value) { continue }
+        $evaluations = $evaluationsProperty.Value
+        $indices = [ordered]@{}
+        foreach ($field in $AaIndexFields) {
+            $property = $evaluations.PSObject.Properties[$field]
+            if ($null -ne $property -and $property.Value -is [ValueType] -and -not [bool]::IsNaN([double]$property.Value)) {
+                $indices[$field] = [double]$property.Value
+            }
+        }
+        if ($indices.Count -eq 0) { continue }
+        foreach ($nameProperty in @($row.PSObject.Properties["name"], $row.PSObject.Properties["slug"])) {
+            if ($null -eq $nameProperty) { continue }
+            $rawName = [string]$nameProperty.Value
+            if ([string]::IsNullOrWhiteSpace($rawName)) { continue }
+            $key = Get-ModelKey $rawName
+            if (-not $scores.ContainsKey($key)) {
+                $scores[$key] = [pscustomobject]@{ aa_name = $rawName; indices = $indices }
+            }
         }
     }
-    return [pscustomobject]@{ scores = $scores; updated_at = $updatedMatch.Groups[1].Value }
+    if ($scores.Count -eq 0) { throw "Artificial Analysis returned no usable index scores" }
+    return [pscustomobject]@{ scores = $scores; intelligence_index_version = $payload.intelligence_index_version }
+}
+
+function Get-AaMatchKeys($Candidate) {
+    $keys = @()
+    foreach ($field in @("id", "name")) {
+        $value = [string]$Candidate.$field
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        $keys += Get-ModelKey $value
+        $current = $value
+        while ($true) {
+            $stripped = $false
+            foreach ($suffix in $AaIdSuffixes) {
+                if ($current.EndsWith($suffix)) {
+                    $current = $current.Substring(0, $current.Length - $suffix.Length)
+                    $keys += Get-ModelKey $current
+                    $stripped = $true
+                    break
+                }
+            }
+            if (-not $stripped) { break }
+        }
+    }
+    return $keys | Where-Object { $_ } | Select-Object -Unique
 }
 
 function Get-AaScore($Candidate, $Scores) {
-    $keys = @((Get-ModelKey $Candidate.id), (Get-ModelKey $Candidate.name))
-    if ($Candidate.id -eq "muse-spark-1.3-contributor-free") { $keys += (Get-ModelKey "Muse Spark 1.3 Contributor Free") }
-    foreach ($key in $keys) { if ($Scores.ContainsKey($key)) { return $Scores[$key] } }
+    foreach ($key in (Get-AaMatchKeys $Candidate | Sort-Object)) {
+        if ($Scores.ContainsKey($key)) { return $Scores[$key] }
+    }
     return $null
 }
 
 function Select-ByAa($Candidates, $Scores) {
-    $best = $null
-    $bestScore = $null
+    $matched = @()
     foreach ($candidate in $Candidates) {
         $score = Get-AaScore $candidate $Scores
-        if ($null -eq $score) { continue }
-        $position = if ($null -ne $score.aa_position) { [double]$score.aa_position } else { 1000000000 }
-        $bestPosition = if ($null -ne $bestScore -and $null -ne $bestScore.aa_position) { [double]$bestScore.aa_position } else { 1000000000 }
-        if ($null -eq $best -or $score.aa_index -gt $bestScore.aa_index -or
-            ($score.aa_index -eq $bestScore.aa_index -and $position -lt $bestPosition) -or
-            ($score.aa_index -eq $bestScore.aa_index -and $position -eq $bestPosition -and $candidate.context -gt $best.context)) {
-            $best = $candidate
-            $bestScore = $score
+        if ($null -ne $score) { $matched += [pscustomobject]@{ candidate = $candidate; score = $score } }
+    }
+    if ($matched.Count -eq 0) { throw "Artificial Analysis has no index scores matching the current free models" }
+
+    # Rank on a single index across all candidates. The Coding, Agentic and
+    # Intelligence indices are separately calibrated, so mixing them in one
+    # comparison would compare incomparable numbers.
+    foreach ($field in $AaIndexFields) {
+        $ranked = @($matched | Where-Object { $_.score.indices.Contains($field) -and $_.score.indices[$field] -ne $null })
+        if ($ranked.Count -eq 0) { continue }
+        $best = $ranked | Sort-Object @{ Expression = { [double]$_.score.indices[$field] }; Descending = $true },
+                                     @{ Expression = { [long]$_.candidate.context }; Descending = $true },
+                                     @{ Expression = { [string]$_.candidate.id }; Descending = $false } |
+                   Select-Object -First 1
+        $scoredIds = @($ranked | ForEach-Object { $_.candidate.id } | Select-Object -Unique)
+        $anyMatchedIds = @($matched | ForEach-Object { $_.candidate.id } | Select-Object -Unique)
+        return [pscustomobject]@{
+            candidate = $best.candidate
+            score = [pscustomobject]@{
+                aa_index = [double]$best.score.indices[$field]; aa_field = $field; aa_name = $best.score.aa_name
+                ranked_count = $scoredIds.Count
+                # Every free candidate the publisher did not score at all, so a
+                # popular but unbenchmarked model is disclosed rather than dropped.
+                unscored_ids = @($Candidates | Where-Object { $anyMatchedIds -notcontains $_.id } | ForEach-Object { $_.id } | Sort-Object)
+            }
         }
     }
-    if ($null -eq $best) { throw "Ebbwater has no AA scores matching the current free models" }
-    return [pscustomobject]@{ candidate = $best; score = $bestScore }
+    throw "Artificial Analysis returned no comparable index scores"
 }
 
 function Get-UsageScores([string]$Html) {
@@ -141,14 +229,20 @@ function Refresh-Selection {
     $catalog = Invoke-RestMethod -Uri $CatalogUrl -TimeoutSec 20
     $candidates = @(Get-FreeCandidates $catalog)
     try {
-        $html = (Invoke-WebRequest -Uri $EbbwaterUrl -UseBasicParsing -TimeoutSec 20).Content
-        $snapshot = Get-EbbwaterSnapshot $html $now
+        $snapshot = Get-AaIndexSnapshot
         $ranked = Select-ByAa $candidates $snapshot.scores
+        $shortField = $ranked.score.aa_field -replace '^artificial_analysis_', '' -replace '_index$', ''
+        # Coverage spans every free candidate, not just the ones carrying the
+        # ranking index, so a partially benchmarked catalog stays visible.
+        $matchedIds = @($candidates | Where-Object { $null -ne (Get-AaScore $_ $snapshot.scores) } | ForEach-Object { $_.id })
         return [ordered]@{
             schema = 1; model = "opencode/$($ranked.candidate.id)"; name = $ranked.candidate.name
-            basis = "Ebbwater AA Index"; ranking_source = "ebbwater-aa"
-            source_updated_at = $snapshot.updated_at; aa_index = $ranked.score.aa_index
-            aa_position = $ranked.score.aa_position; candidate_count = $candidates.Count
+            basis = "Artificial Analysis $shortField"; ranking_source = "aa-api"
+            intelligence_index_version = $snapshot.intelligence_index_version
+            aa_index = $ranked.score.aa_index; aa_field = $ranked.score.aa_field; aa_name = $ranked.score.aa_name
+            ranked_count = $ranked.score.ranked_count; benchmarked_count = $matchedIds.Count
+            candidate_count = $candidates.Count
+            unscored_ids = @($candidates | Where-Object { $matchedIds -notcontains $_.id } | ForEach-Object { $_.id } | Sort-Object)
             selected_at = $now.ToUnixTimeSeconds()
         }
     } catch {
@@ -231,11 +325,17 @@ function ConvertTo-NativeJsonArgument([string]$Json) {
 function Show-Status($Selection) {
     $fallback = $Selection.ranking_source -eq "fallback"
     Write-Output "OpenCode free-model status"
-    Write-Output $(if ($fallback) { "Health: DEGRADED - FALLBACK ACTIVE" } else { "Health: OK - Ebbwater AA ranking active" })
+    Write-Output $(if ($fallback) { "Health: DEGRADED - FALLBACK ACTIVE" } else { "Health: OK - Artificial Analysis ranking active" })
     Write-Output "Model: $($Selection.name) ($($Selection.model))"
     Write-Output "Ranking: $($Selection.basis)"
-    if ($Selection.PSObject.Properties["aa_index"]) { Write-Output "AA index: $($Selection.aa_index) (AA position #$($Selection.aa_position))" }
-    if ($Selection.PSObject.Properties["source_updated_at"]) { Write-Output "Ebbwater snapshot: $($Selection.source_updated_at)" }
+    if ($Selection.PSObject.Properties["aa_index"]) { Write-Output "AA index: $($Selection.aa_index) (source: $($Selection.aa_field))" }
+    if ($Selection.PSObject.Properties["intelligence_index_version"]) { Write-Output "AA Intelligence Index version: $($Selection.intelligence_index_version)" }
+    # A successful ranking says nothing about models the publisher has not
+    # scored, so surface them rather than implying full coverage.
+    if ($Selection.PSObject.Properties["unscored_ids"] -and @($Selection.unscored_ids).Count -gt 0) {
+        Write-Output "Coverage: $($Selection.benchmarked_count) of $($Selection.candidate_count) free models scored by AA"
+        Write-Output "Not scored by AA ($(@($Selection.unscored_ids).Count)): $(@($Selection.unscored_ids) -join ', ')"
+    }
     if ($Selection.PSObject.Properties["fallback_reason"]) { Write-Output "Fallback reason: $($Selection.fallback_reason)" }
     Write-Output "Cache: $($Selection.cache)"
 }
@@ -270,10 +370,10 @@ try {
 } catch { Fail "could not create an explicit-model OpenCode session: $($_.Exception.Message)" }
 
 if ($Selection.ranking_source -eq "fallback") {
-    [Console]::Error.WriteLine("WARNING: Ebbwater AA ranking unavailable - FALLBACK ACTIVE.")
+    [Console]::Error.WriteLine("WARNING: Artificial Analysis ranking unavailable - FALLBACK ACTIVE.")
     [Console]::Error.WriteLine("Reason: $($Selection.fallback_reason)")
 } else {
-    [Console]::Error.WriteLine("Ebbwater AA ranking active: index $($Selection.aa_index) (snapshot $($Selection.source_updated_at)).")
+    [Console]::Error.WriteLine("Artificial Analysis ranking active: $($Selection.aa_index) ($($Selection.aa_field), index v$($Selection.intelligence_index_version)).")
 }
 [Console]::Error.WriteLine("OpenCode free launcher: $($Selection.name) ($($Selection.model)) via $($Selection.basis) [$($Selection.cache)].")
 [Console]::Error.WriteLine("Free-model session: do not submit private or confidential material.")

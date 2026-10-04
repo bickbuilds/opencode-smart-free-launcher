@@ -14,6 +14,33 @@ module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
 
 
+def aa_model(name, slug=None, coding=None, agentic=None, intelligence=None):
+    evaluations = {}
+    if coding is not None:
+        evaluations["artificial_analysis_coding_index"] = coding
+    if agentic is not None:
+        evaluations["artificial_analysis_agentic_index"] = agentic
+    if intelligence is not None:
+        evaluations["artificial_analysis_intelligence_index"] = intelligence
+    return {"name": name, "slug": slug or name, "evaluations": evaluations}
+
+
+def aa_payload(models, has_more=False, version=4.3):
+    return json.dumps(
+        {
+            "tier": "free",
+            "intelligence_index_version": version,
+            "pagination": {
+                "page": 1,
+                "page_size": 200,
+                "total_pages": 2 if has_more else 1,
+                "has_more": has_more,
+            },
+            "data": models,
+        }
+    )
+
+
 class LauncherTests(unittest.TestCase):
     def test_filters_paid_and_non_tool_models(self):
         catalog = {
@@ -42,39 +69,147 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(selected["id"], "space-bunny-free")
         self.assertIn("weekly usage", basis)
 
-    def test_ebbwater_aa_rank_wins_and_matches_muse_alias(self):
-        now = module.datetime(2026, 9, 28, tzinfo=module.timezone.utc).timestamp()
-        html = '''
-        var ZEN = [
-          ["Muse Spark 1.3 Contributor Free",48,17,0,0,"free+trn"],
-          ["MiMo-V2.6-Flash Free",38,60,0,0,"free"]
-        ];
-        /* Coding Agent Index badges */
-        var AA_UPDATED = "2026-09-27T20:20:11Z";
-        '''
-        scores, updated = module.ebbwater_snapshot(html, now)
-        candidates = [
+    def test_aa_api_reports_coverage_and_unscored(self):
+        """A clean ranking must still disclose models the publisher skipped."""
+        catalog = json.dumps(
             {
-                "id": "muse-spark-1.3-contributor-free",
-                "name": "Muse Spark 1.3 Free",
-                "context": 100,
-            },
+                "opencode": {
+                    "models": {
+                        "muse-free": {"cost": {"input": 0, "output": 0}, "tool_call": True, "name": "Muse"},
+                        "space-bunny-free": {"cost": {"input": 0, "output": 0}, "tool_call": True, "name": "Bunny"},
+                    }
+                }
+            }
+        )
+        payload = aa_payload([aa_model("Muse", coding=75)])
+        with mock.patch.object(module, "fetch_text", side_effect=[catalog, payload]):
+            with mock.patch.dict(module.os.environ, {"ARTIFICIAL_ANALYSIS_API_KEY": "k"}, clear=False):
+                selection = module.refresh_selection(module.time.time())
+        self.assertEqual(selection["ranking_source"], "aa-api")
+        self.assertEqual(selection["model"], "opencode/muse-free")
+        # The unscored-but-popular model must be named, not silently dropped.
+        self.assertEqual(selection["unscored_ids"], ["space-bunny-free"])
+        self.assertEqual(selection["candidate_count"], 2)
+        self.assertEqual(selection["benchmarked_count"], 1)
+
+    def test_aa_api_coverage_omits_models_lacking_the_ranking_index(self):
+        """Coverage counts every scored model, not only the ranked subset."""
+        payload = aa_payload(
+            [
+                aa_model("Coding Only", coding=70),
+                aa_model("Intelligence Only", intelligence=90),
+            ]
+        )
+        with mock.patch.object(module, "fetch_text", return_value=payload):
+            with mock.patch.dict(module.os.environ, {"ARTIFICIAL_ANALYSIS_API_KEY": "k"}, clear=False):
+                scores, _ = module.aa_index_snapshot()
+        candidates = [
+            {"id": "coding-only", "name": "Coding Only", "context": 100},
+            {"id": "intelligence-only", "name": "Intelligence Only", "context": 100},
+        ]
+        _, score = module.rank_candidates_by_aa(candidates, scores)
+        # Both are scored by AA; only one carries the coding index used to rank.
+        self.assertEqual(score["scored_count"], 1)
+
+    def test_aa_api_reports_publisher_name(self):
+        """aa_name is the benchmark publisher's name, not the Zen display name."""
+        payload = aa_payload([aa_model("Muse Spark 1.3 Contributor", coding=48)])
+        with mock.patch.object(module, "fetch_text", return_value=payload):
+            with mock.patch.dict(module.os.environ, {"ARTIFICIAL_ANALYSIS_API_KEY": "k"}, clear=False):
+                scores, _ = module.aa_index_snapshot()
+        candidates = [{"id": "muse-spark-1.3-contributor-free", "name": "Muse Spark 1.3 Free", "context": 100}]
+        _, score = module.rank_candidates_by_aa(candidates, scores)
+        self.assertEqual(score["aa_name"], "Muse Spark 1.3 Contributor")
+
+    def test_aa_api_rank_wins_and_strips_zen_suffixes(self):
+        """The '-contributor-free' tier matches the publisher's plain name."""
+        payload = aa_payload(
+            [
+                aa_model("Muse Spark 1.3 Contributor", coding=48),
+                aa_model("MiMo-V2.6-Flash", coding=38),
+            ]
+        )
+        with mock.patch.object(module, "fetch_text", return_value=payload) as fetch:
+            with mock.patch.dict(module.os.environ, {"ARTIFICIAL_ANALYSIS_API_KEY": "k"}, clear=False):
+                scores, version = module.aa_index_snapshot()
+        self.assertEqual(fetch.call_args.kwargs["headers"]["x-api-key"], "k")
+        self.assertEqual(version, 4.3)
+        candidates = [
+            {"id": "muse-spark-1.3-contributor-free", "name": "Muse Spark 1.3 Free", "context": 100},
             {"id": "mimo-v2.6-flash-free", "name": "MiMo-V2.6-Flash Free", "context": 200},
         ]
         selected, score = module.rank_candidates_by_aa(candidates, scores)
         self.assertEqual(selected["id"], "muse-spark-1.3-contributor-free")
         self.assertEqual(score["aa_index"], 48)
-        self.assertEqual(updated, "2026-09-27T20:20:11Z")
+        self.assertEqual(score["aa_field"], "artificial_analysis_coding_index")
 
-    def test_stale_ebbwater_snapshot_is_rejected(self):
-        now = module.datetime(2026, 10, 2, tzinfo=module.timezone.utc).timestamp()
-        html = '''
-        var ZEN = [["Model",40,1,0,0,"free"]];
-        /* Coding Agent Index badges */
-        var AA_UPDATED = "2026-09-27T20:20:11Z";
-        '''
-        with self.assertRaisesRegex(module.SelectionError, "stale"):
-            module.ebbwater_snapshot(html, now)
+    def test_aa_api_requires_key(self):
+        with mock.patch.dict(module.os.environ, {}, clear=False):
+            module.os.environ.pop("ARTIFICIAL_ANALYSIS_API_KEY", None)
+            with self.assertRaisesRegex(module.SelectionError, "ARTIFICIAL_ANALYSIS_API_KEY"):
+                module.aa_api_key()
+
+    def test_aa_api_follows_pagination(self):
+        first = aa_payload([aa_model("A", coding=1)], has_more=True)
+        second = aa_payload([aa_model("B", coding=2)], has_more=False)
+        with mock.patch.object(module, "fetch_text", side_effect=[first, second]) as fetch:
+            with mock.patch.dict(module.os.environ, {"ARTIFICIAL_ANALYSIS_API_KEY": "k"}, clear=False):
+                payload = module.aa_index_payload()
+        self.assertEqual(len(payload["models"]), 2)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertIn("page=2", fetch.call_args.args[0])
+
+    def test_aa_api_does_not_mix_index_scales(self):
+        """A coding-index score must never be compared against an intelligence one."""
+        payload = aa_payload(
+            [
+                aa_model("High Coding", coding=90, intelligence=10),
+                aa_model("High Intelligence", intelligence=95),
+            ]
+        )
+        with mock.patch.object(module, "fetch_text", return_value=payload):
+            with mock.patch.dict(module.os.environ, {"ARTIFICIAL_ANALYSIS_API_KEY": "k"}, clear=False):
+                scores, _ = module.aa_index_snapshot()
+        candidates = [
+            {"id": "high-coding", "name": "High Coding", "context": 100},
+            {"id": "high-intelligence", "name": "High Intelligence", "context": 100},
+        ]
+        selected, score = module.rank_candidates_by_aa(candidates, scores)
+        # 95 on the intelligence index must not beat 90 on the preferred coding index.
+        self.assertEqual(selected["id"], "high-coding")
+        self.assertEqual(score["aa_index"], 90)
+        self.assertEqual(score["aa_field"], "artificial_analysis_coding_index")
+
+    def test_aa_api_falls_back_to_next_index_field(self):
+        payload = aa_payload([aa_model("Only Intelligence", intelligence=42)])
+        with mock.patch.object(module, "fetch_text", return_value=payload):
+            with mock.patch.dict(module.os.environ, {"ARTIFICIAL_ANALYSIS_API_KEY": "k"}, clear=False):
+                scores, _ = module.aa_index_snapshot()
+        candidates = [{"id": "only-intelligence", "name": "Only Intelligence", "context": 100}]
+        selected, score = module.rank_candidates_by_aa(candidates, scores)
+        self.assertEqual(selected["id"], "only-intelligence")
+        self.assertEqual(score["aa_field"], "artificial_analysis_intelligence_index")
+
+    def test_aa_api_failure_degrades_to_usage_fallback(self):
+        catalog = json.dumps(
+            {
+                "opencode": {
+                    "models": {
+                        "free-coder": {
+                            "cost": {"input": 0, "output": 0},
+                            "tool_call": True,
+                            "name": "Free Coder",
+                        }
+                    }
+                }
+            }
+        )
+        with mock.patch.object(module, "fetch_text", side_effect=[catalog, OSError("boom"), ""]):
+            with mock.patch.dict(module.os.environ, {"ARTIFICIAL_ANALYSIS_API_KEY": "k"}, clear=False):
+                selection = module.refresh_selection(module.time.time())
+        self.assertEqual(selection["ranking_source"], "fallback")
+        self.assertIn("boom", selection["fallback_reason"])
+        self.assertEqual(selection["model"], "opencode/free-coder")
 
     def test_resume_and_commands_pass_through(self):
         self.assertTrue(module.is_resume(["--continue"]))
