@@ -110,6 +110,46 @@ class LauncherTests(unittest.TestCase):
         _, score = module.rank_candidates_by_aa(candidates, scores)
         # Both are scored by AA; only one carries the coding index used to rank.
         self.assertEqual(score["scored_count"], 1)
+        self.assertEqual(score["benchmarked_count"], 2)
+        self.assertEqual(score["unscored_ids"], [])
+
+    def test_aa_matching_preserves_variants_and_exact_names(self):
+        models = [
+            aa_model("MiMo V2.6", coding=99),
+            aa_model("MiMo V2.6 Flash", coding=38),
+            aa_model("Competitor", coding=50),
+        ]
+        with mock.patch.object(module, "aa_index_payload", return_value={
+            "models": models, "intelligence_index_version": 4.3
+        }):
+            scores, _ = module.aa_index_snapshot()
+        candidate = {"id": "mimo-v2.6-flash-free", "name": "MiMo V2.6 Flash Free", "context": 200}
+        self.assertEqual(module.aa_score_for(candidate, scores)["aa_name"], "MiMo V2.6 Flash")
+        selected, score = module.rank_candidates_by_aa(
+            [candidate, {"id": "competitor", "name": "Competitor", "context": 100}], scores
+        )
+        self.assertEqual(selected["id"], "competitor")
+        self.assertEqual(score["aa_index"], 50)
+        for variant in ("flash", "lightning", "tiny"):
+            with self.subTest(variant=variant):
+                self.assertIsNone(module.aa_score_for(
+                    {"id": f"mimo-v2.6-{variant}-free", "name": f"MiMo V2.6 {variant} Free"},
+                    {"mimov26": scores["mimov26"]},
+                ))
+
+    def test_aa_matching_prefers_exact_name_over_stripped_id(self):
+        candidate = {"id": "muse-contributor-free", "name": "Publisher Name"}
+        exact = {"aa_name": "Publisher Name"}
+        self.assertIs(module.aa_score_for(candidate, {
+            "muse": {"aa_name": "Muse"}, "publishername": exact
+        }), exact)
+
+    def test_aa_matching_prefers_contributor_before_base(self):
+        contributor = {"aa_name": "Muse Contributor"}
+        candidate = {"id": "muse-contributor-free", "name": "Muse Free"}
+        self.assertIs(module.aa_score_for(candidate, {
+            "musecontributor": contributor, "muse": {"aa_name": "Muse"}
+        }), contributor)
 
     def test_aa_api_reports_publisher_name(self):
         """aa_name is the benchmark publisher's name, not the Zen display name."""
@@ -274,6 +314,7 @@ class LauncherTests(unittest.TestCase):
                         "model": "opencode/free-coder",
                         "name": "Free Coder",
                         "basis": "test",
+                        "ranking_source": "aa-api",
                         "candidate_count": 1,
                         "selected_at": module.time.time(),
                     }
@@ -291,6 +332,26 @@ class LauncherTests(unittest.TestCase):
             "selected_at": module.time.time() - 2 * 60 * 60,
         }
         self.assertFalse(module.cache_is_fresh(value, module.time.time()))
+
+    def test_legacy_cache_refreshes_and_is_not_reused_on_failure(self):
+        legacy = {
+            "schema": 1, "model": "opencode/legacy", "name": "Legacy",
+            "basis": "Ebbwater AA Index", "ranking_source": "ebbwater-aa",
+            "aa_index": 40, "selected_at": module.time.time(),
+        }
+        refreshed = {**legacy, "model": "opencode/current", "ranking_source": "aa-api"}
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.dict(module.os.environ, {"XDG_CACHE_HOME": temp}, clear=False):
+                module.write_cache(legacy)
+                with mock.patch.object(module, "refresh_selection", return_value=refreshed) as refresh:
+                    selected = module.select_model()
+                refresh.assert_called_once()
+                self.assertEqual(selected["model"], "opencode/current")
+                self.assertEqual(selected["cache"], "refreshed")
+                module.write_cache(legacy)
+                with mock.patch.object(module, "refresh_selection", side_effect=module.SelectionError("offline")):
+                    with self.assertRaisesRegex(module.SelectionError, "offline"):
+                        module.select_model()
 
 
 if __name__ == "__main__":

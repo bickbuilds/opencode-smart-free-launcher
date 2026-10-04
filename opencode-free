@@ -36,7 +36,7 @@ AA_INDEX_FIELDS = (
 )
 # Zen-only distribution qualifiers, peeled off when matching a Zen id against a
 # benchmark publisher's model name.
-AA_ID_SUFFIXES = ("-free", "-preview", "-contributor", "-lightning", "-flash", "-tiny")
+AA_ID_SUFFIXES = ("-free", "-preview", "-contributor")
 SUBCOMMANDS = {
     "acp",
     "api",
@@ -277,7 +277,7 @@ def aa_index_snapshot() -> tuple[dict[str, dict[str, Any]], Any]:
     return scores, payload["intelligence_index_version"]
 
 
-def aa_match_keys(candidate: dict[str, Any]) -> set[str]:
+def aa_match_keys(candidate: dict[str, Any]) -> list[str]:
     """Normalised keys a Zen model id can legitimately match on.
 
     Zen appends distribution qualifiers the benchmark publisher has no reason to
@@ -285,26 +285,29 @@ def aa_match_keys(candidate: dict[str, Any]) -> set[str]:
     peeled off in turn and every intermediate form is offered as a candidate key.
     This replaces a hardcoded alias for a single Muse model.
     """
-    keys: set[str] = set()
-    for field in ("id", "name"):
-        value = str(candidate.get(field) or "").strip()
-        if not value:
-            continue
-        keys.add(model_key(value))
-        current = value
-        while True:
+    # Try both exact identifiers before stripping either one. Each subsequent
+    # tier removes one distribution qualifier; variant names remain intact.
+    current = [
+        re.sub(r"\s+", "-", str(candidate.get(field) or "").strip().lower())
+        for field in ("id", "name")
+    ]
+    keys: list[str] = []
+    while current:
+        stripped = []
+        for value in current:
+            key = model_key(value)
+            if key and key not in keys:
+                keys.append(key)
             for suffix in AA_ID_SUFFIXES:
-                if current.endswith(suffix):
-                    current = current[: -len(suffix)]
-                    keys.add(model_key(current))
+                if value.endswith(suffix):
+                    stripped.append(value[: -len(suffix)])
                     break
-            else:
-                break
-    return {key for key in keys if key}
+        current = stripped
+    return keys
 
 
 def aa_score_for(candidate: dict[str, Any], scores: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-    for key in sorted(aa_match_keys(candidate)):
+    for key in aa_match_keys(candidate):
         if key in scores:
             return scores[key]
     return None
@@ -340,6 +343,7 @@ def rank_candidates_by_aa(
             "aa_field": field,
             "aa_name": publisher_name,
             "scored_count": len(scored_ids),
+            "benchmarked_count": len(any_matched_ids),
             # Every free candidate the publisher did not score at all, so a
             # popular but unbenchmarked model is disclosed rather than dropped.
             "unscored_ids": sorted(
@@ -360,7 +364,8 @@ def read_cache() -> dict[str, Any] | None:
 def cache_is_fresh(value: dict[str, Any], now: float) -> bool:
     ttl = FALLBACK_CACHE_TTL_SECONDS if value.get("ranking_source") == "fallback" else CACHE_TTL_SECONDS
     return (
-        isinstance(value.get("model"), str)
+        value.get("ranking_source") in ("aa-api", "fallback")
+        and isinstance(value.get("model"), str)
         and isinstance(value.get("selected_at"), (int, float))
         and now - float(value["selected_at"]) < ttl
     )
@@ -388,13 +393,6 @@ def refresh_selection(now: float) -> dict[str, Any]:
     try:
         aa_scores, index_version = aa_index_snapshot()
         selected, aa = rank_candidates_by_aa(candidates, aa_scores)
-        # Coverage spans every free candidate, not just the ones carrying the
-        # ranking index, so a partially benchmarked catalog stays visible.
-        scored_ids = {
-            item["id"]
-            for item in candidates
-            if aa_score_for(item, aa_scores) is not None
-        }
         selection_details = {
             "basis": f"Artificial Analysis {aa['aa_field'].removeprefix('artificial_analysis_').removesuffix('_index')}",
             "ranking_source": "aa-api",
@@ -403,11 +401,9 @@ def refresh_selection(now: float) -> dict[str, Any]:
             "aa_field": aa["aa_field"],
             "aa_name": aa["aa_name"],
             "ranked_count": aa["scored_count"],
-            "benchmarked_count": len(scored_ids),
+            "benchmarked_count": aa["benchmarked_count"],
             "candidate_count": len(candidates),
-            "unscored_ids": sorted(
-                item["id"] for item in candidates if item["id"] not in scored_ids
-            ),
+            "unscored_ids": aa["unscored_ids"],
         }
     except (OSError, urllib.error.URLError, SelectionError) as error:
         fallback_reason = str(error)

@@ -14,7 +14,7 @@ $FallbackTtlSeconds = 60 * 60
 $AaIndexFields = @("artificial_analysis_coding_index", "artificial_analysis_agentic_index", "artificial_analysis_intelligence_index")
 # Zen-only distribution qualifiers, peeled off when matching a Zen id against a
 # benchmark publisher's model name.
-$AaIdSuffixes = @("-free", "-preview", "-contributor", "-lightning", "-flash", "-tiny")
+$AaIdSuffixes = @("-free", "-preview", "-contributor")
 $ConfigPath = Join-Path $env:LOCALAPPDATA "opencode-smart-launcher\config.json"
 $CacheDir = Join-Path $env:LOCALAPPDATA "opencode-free-launcher"
 $CachePath = Join-Path $CacheDir "selection.json"
@@ -105,7 +105,8 @@ function Get-AaIndexSnapshot {
         $indices = [ordered]@{}
         foreach ($field in $AaIndexFields) {
             $property = $evaluations.PSObject.Properties[$field]
-            if ($null -ne $property -and $property.Value -is [ValueType] -and -not [bool]::IsNaN([double]$property.Value)) {
+            if ($null -ne $property -and $property.Value -is [ValueType] -and
+                $property.Value -isnot [bool] -and -not [double]::IsNaN([double]$property.Value)) {
                 $indices[$field] = [double]$property.Value
             }
         }
@@ -125,30 +126,30 @@ function Get-AaIndexSnapshot {
 }
 
 function Get-AaMatchKeys($Candidate) {
+    # Try both exact identifiers before stripping either one. Variant names
+    # remain intact as distribution qualifiers are removed one tier at a time.
     $keys = @()
-    foreach ($field in @("id", "name")) {
-        $value = [string]$Candidate.$field
-        if ([string]::IsNullOrWhiteSpace($value)) { continue }
-        $keys += Get-ModelKey $value
-        $current = $value
-        while ($true) {
-            $stripped = $false
+    $current = @("id", "name" | ForEach-Object {
+        ([string]$Candidate.$_).Trim().ToLowerInvariant() -replace '\s+', '-'
+    })
+    while ($current.Count -gt 0) {
+        $stripped = @()
+        foreach ($value in $current) {
+            $keys += Get-ModelKey $value
             foreach ($suffix in $AaIdSuffixes) {
-                if ($current.EndsWith($suffix)) {
-                    $current = $current.Substring(0, $current.Length - $suffix.Length)
-                    $keys += Get-ModelKey $current
-                    $stripped = $true
+                if ($value.EndsWith($suffix)) {
+                    $stripped += $value.Substring(0, $value.Length - $suffix.Length)
                     break
                 }
             }
-            if (-not $stripped) { break }
         }
+        $current = $stripped
     }
     return $keys | Where-Object { $_ } | Select-Object -Unique
 }
 
 function Get-AaScore($Candidate, $Scores) {
-    foreach ($key in (Get-AaMatchKeys $Candidate | Sort-Object)) {
+    foreach ($key in (Get-AaMatchKeys $Candidate)) {
         if ($Scores.ContainsKey($key)) { return $Scores[$key] }
     }
     return $null
@@ -179,6 +180,7 @@ function Select-ByAa($Candidates, $Scores) {
             score = [pscustomobject]@{
                 aa_index = [double]$best.score.indices[$field]; aa_field = $field; aa_name = $best.score.aa_name
                 ranked_count = $scoredIds.Count
+                benchmarked_count = $anyMatchedIds.Count
                 # Every free candidate the publisher did not score at all, so a
                 # popular but unbenchmarked model is disclosed rather than dropped.
                 unscored_ids = @($Candidates | Where-Object { $anyMatchedIds -notcontains $_.id } | ForEach-Object { $_.id } | Sort-Object)
@@ -232,17 +234,14 @@ function Refresh-Selection {
         $snapshot = Get-AaIndexSnapshot
         $ranked = Select-ByAa $candidates $snapshot.scores
         $shortField = $ranked.score.aa_field -replace '^artificial_analysis_', '' -replace '_index$', ''
-        # Coverage spans every free candidate, not just the ones carrying the
-        # ranking index, so a partially benchmarked catalog stays visible.
-        $matchedIds = @($candidates | Where-Object { $null -ne (Get-AaScore $_ $snapshot.scores) } | ForEach-Object { $_.id })
         return [ordered]@{
             schema = 1; model = "opencode/$($ranked.candidate.id)"; name = $ranked.candidate.name
             basis = "Artificial Analysis $shortField"; ranking_source = "aa-api"
             intelligence_index_version = $snapshot.intelligence_index_version
             aa_index = $ranked.score.aa_index; aa_field = $ranked.score.aa_field; aa_name = $ranked.score.aa_name
-            ranked_count = $ranked.score.ranked_count; benchmarked_count = $matchedIds.Count
+            ranked_count = $ranked.score.ranked_count; benchmarked_count = $ranked.score.benchmarked_count
             candidate_count = $candidates.Count
-            unscored_ids = @($candidates | Where-Object { $matchedIds -notcontains $_.id } | ForEach-Object { $_.id } | Sort-Object)
+            unscored_ids = @($ranked.score.unscored_ids)
             selected_at = $now.ToUnixTimeSeconds()
         }
     } catch {
@@ -268,7 +267,9 @@ function Get-Selection([bool]$ForceRefresh) {
         if (Test-Path -LiteralPath $CachePath) {
             try { $cached = Get-Content -LiteralPath $CachePath -Raw | ConvertFrom-Json } catch {}
         }
-        if ($cached) {
+        # Ebbwater selections predate the API metadata used by status and launch.
+        # Refresh them even within the TTL, and never reuse them after failure.
+        if ($cached -and $cached.ranking_source -in @("aa-api", "fallback")) {
             $ttl = if ($cached.ranking_source -eq "fallback") { $FallbackTtlSeconds } else { $HealthyTtlSeconds }
             $fresh = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$cached.selected_at) -lt $ttl
             if (-not $ForceRefresh -and $fresh) { $cached | Add-Member -NotePropertyName cache -NotePropertyValue "fresh" -Force; return $cached }
